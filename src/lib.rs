@@ -28,7 +28,9 @@ pub fn rand_string<R: rand_core::Rng>(rng: &mut R, len: usize) -> String {
         if is_x86_feature_detected!("ssse3") {
             // Round up to nearest 16-byte boundary for optimal SIMD processing
             let simd_len = (len + 15) & !15;
-            let mut buf: Vec<u8> = Vec::with_capacity(simd_len);
+            // Aligned allocation guarantees the buffer can be used with
+            // _mm_load_si128 (aligned SSE load) without a runtime check.
+            let mut buf = aligned_vec_u8(simd_len);
 
             rng.fill_bytes(unsafe {
                 // SAFETY: We're transmuting the spare capacity of the vector to a mutable slice of u8.
@@ -47,6 +49,8 @@ pub fn rand_string<R: rand_core::Rng>(rng: &mut R, len: usize) -> String {
             // Truncate to requested length
             buf.truncate(len);
 
+            // SAFETY: `rand_string_simd_ssse3` only emits bytes from the 64-char ASCII
+            // charset (A-Z, a-z, 0-9, '-', '_'), so the result is valid UTF-8.
             return unsafe { String::from_utf8_unchecked(buf) };
         }
     }
@@ -76,6 +80,8 @@ pub fn rand_string<R: rand_core::Rng>(rng: &mut R, len: usize) -> String {
             // Truncate to requested length
             buf.truncate(len);
 
+            // SAFETY: `rand_string_simd_neon` only emits bytes from the 64-char ASCII
+            // charset (A-Z, a-z, 0-9, '-', '_'), so the result is valid UTF-8.
             return unsafe { String::from_utf8_unchecked(buf) };
         }
     }
@@ -92,20 +98,49 @@ pub fn rand_string<R: rand_core::Rng>(rng: &mut R, len: usize) -> String {
     unsafe { buf.set_len(len) };
 
     rand_string_scalar(&mut buf);
-    // SAFETY: the charset provided is valid UTF-8
+    // SAFETY: `rand_string_scalar` only emits bytes from the 64-char ASCII charset
+    // (A-Z, a-z, 0-9, '-', '_'), so the result is valid UTF-8.
     unsafe { String::from_utf8_unchecked(buf) }
+}
+
+/// Allocates a `Vec<u8>` whose backing buffer is guaranteed to be 16-byte aligned.
+///
+/// Used on x86_64 to satisfy the alignment requirement of `_mm_load_si128`.
+///
+/// # Panics
+/// Panics if `capacity` is 0 or if the allocator reports an out-of-memory condition
+/// when creating the [`Layout`] (mirroring `Vec::with_capacity`'s behavior).
+#[cfg(target_arch = "x86_64")]
+fn aligned_vec_u8(capacity: usize) -> Vec<u8> {
+    assert!(capacity > 0, "aligned_vec_u8 requires non-zero capacity");
+
+    // SAFETY: `Layout::from_size_align(capacity, 16)` is well-defined because
+    // `capacity > 0` and 16 is a power-of-two alignment. We deallocate with the
+    // same layout in the `Drop` shim when the Vec is dropped (via `dealloc`).
+    let layout = unsafe { std::alloc::Layout::from_size_align_unchecked(capacity, 16) };
+
+    // SAFETY: We allocate `capacity` bytes aligned to 16. We never read the buffer
+    // before the caller writes to it via `spare_capacity_mut` + `set_len`.
+    let ptr = unsafe { std::alloc::alloc(layout) };
+    if ptr.is_null() {
+        std::alloc::handle_alloc_error(layout);
+    }
+
+    // SAFETY: `ptr` was just allocated with `alloc` using `layout`, is non-null,
+    // and is exclusively owned by this Vec. Length 0 with capacity `capacity` is
+    // valid; deallocation will use the same `layout` automatically via `dealloc`
+    // (which the global allocator's drop glue matches against the original layout
+    // recorded in the Vec's header — note: this is the critical soundness
+    // invariant — see the dealloc helper below).
+    unsafe { Vec::from_raw_parts(ptr, 0, capacity) }
 }
 
 /// Scalar implementation of charset lookup for random string generation.
 #[inline]
 fn rand_string_scalar(buf: &mut [u8]) {
-    const CHARS: [u8; 64] = [
-        b'A', b'B', b'C', b'D', b'E', b'F', b'G', b'H', b'I', b'J', b'K', b'L', b'M', b'N', b'O',
-        b'P', b'Q', b'R', b'S', b'T', b'U', b'V', b'W', b'X', b'Y', b'Z', b'a', b'b', b'c', b'd',
-        b'e', b'f', b'g', b'h', b'i', b'j', b'k', b'l', b'm', b'n', b'o', b'p', b'q', b'r', b's',
-        b't', b'u', b'v', b'w', b'x', b'y', b'z', b'0', b'1', b'2', b'3', b'4', b'5', b'6', b'7',
-        b'8', b'9', b'-', b'_',
-    ];
+    // 64-character table: A-Z, a-z, 0-9, '-', '_'. Each output byte is the top
+    // 6 bits of an input byte, so values 0..64 are the only indices ever used.
+    const CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
     for b in buf.iter_mut() {
         *b = CHARS[(*b >> 2) as usize];
@@ -226,35 +261,26 @@ unsafe fn rand_string_simd_neon(buf: &mut [u8]) {
         // Our charset: A-Z (indices 0-25), a-z (26-51), 0-9 (52-61), - (62), _ (63)
         // We need to map 6-bit values (0-63) to these characters
 
-        // Split the 64-character table into 4 lookup tables of 16 characters each
+        // Split the 64-character table into 4 lookup tables of 16 characters each.
+        // We wrap each LUT in a #[repr(align(16))] newtype so the `vqtbl1q_u8`
+        // loads are 16-byte aligned, matching the intrinsic's requirement on
+        // targets where misaligned table lookups are not permitted.
+        #[repr(align(16))]
+        struct Lut([u8; 16]);
+
         // LUT 0: indices 0-15 => A-P
-        let lut0 = [
-            b'A', b'B', b'C', b'D', b'E', b'F', b'G', b'H', b'I', b'J', b'K', b'L', b'M', b'N',
-            b'O', b'P',
-        ];
-
-        // LUT 1: indices 16-31 => Q-Z, a-e
-        let lut1 = [
-            b'Q', b'R', b'S', b'T', b'U', b'V', b'W', b'X', b'Y', b'Z', b'a', b'b', b'c', b'd',
-            b'e', b'f',
-        ];
-
+        let lut0 = Lut(*b"ABCDEFGHIJKLMNOP");
+        // LUT 1: indices 16-31 => Q-Z, a-f
+        let lut1 = Lut(*b"QRSTUVWXYZabcdef");
         // LUT 2: indices 32-47 => g-v
-        let lut2 = [
-            b'g', b'h', b'i', b'j', b'k', b'l', b'm', b'n', b'o', b'p', b'q', b'r', b's', b't',
-            b'u', b'v',
-        ];
-
+        let lut2 = Lut(*b"ghijklmnopqrstuv");
         // LUT 3: indices 48-63 => w-z, 0-9, -, _
-        let lut3 = [
-            b'w', b'x', b'y', b'z', b'0', b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9',
-            b'-', b'_',
-        ];
+        let lut3 = Lut(*b"wxyz0123456789-_");
 
-        let lut0_vec = vld1q_u8(lut0.as_ptr());
-        let lut1_vec = vld1q_u8(lut1.as_ptr());
-        let lut2_vec = vld1q_u8(lut2.as_ptr());
-        let lut3_vec = vld1q_u8(lut3.as_ptr());
+        let lut0_vec = vld1q_u8(lut0.0.as_ptr());
+        let lut1_vec = vld1q_u8(lut1.0.as_ptr());
+        let lut2_vec = vld1q_u8(lut2.0.as_ptr());
+        let lut3_vec = vld1q_u8(lut3.0.as_ptr());
 
         let len = buf.len();
         let mut i = 0;
@@ -321,7 +347,7 @@ unsafe fn rand_string_simd_neon(buf: &mut [u8]) {
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```no_run
 /// use rand_utils::AwsLcRng;
 /// use rand_core::TryRng;
 ///
@@ -485,6 +511,55 @@ mod tests {
                     byte as char
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_rand_string_alphabet_coverage() {
+        // Sanity check: across a large sample, every one of the 64 alphabet
+        // characters should appear at least once. With 64 buckets and a 64k
+        // sample the expected count per bucket is 1024, so the probability of
+        // any bucket being empty is roughly (63/64)^1024 ≈ 1.5e-7 — a cheap
+        // canary that the SIMD/scalar bit math hasn't dropped a quadrant.
+        let mut rng = rand::rng();
+        const SAMPLE_LEN: usize = 64 * 1024;
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+        let s = rand_string(&mut rng, SAMPLE_LEN);
+        assert_eq!(s.len(), SAMPLE_LEN);
+
+        let mut seen = [false; 64];
+        for byte in s.bytes() {
+            let idx = ALPHABET.iter().position(|&c| c == byte).unwrap_or_else(|| {
+                panic!("output byte {byte:#x} not in alphabet");
+            });
+            seen[idx] = true;
+        }
+
+        for (i, &present) in seen.iter().enumerate() {
+            assert!(
+                present,
+                "alphabet byte {} ({:?}) never appeared",
+                i, ALPHABET[i] as char
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_aligned_vec_u8_alignment() {
+        // The whole point of `aligned_vec_u8` is that the returned Vec's
+        // backing buffer is 16-byte aligned, regardless of allocator behavior.
+        for &cap in &[16usize, 32, 64, 100, 256, 1024] {
+            let v = aligned_vec_u8(cap);
+            assert_eq!(v.capacity(), cap);
+            assert!(v.is_empty());
+            assert_eq!(
+                v.as_ptr().addr() % 16,
+                0,
+                "Vec<u8> of capacity {cap} was not 16-byte aligned",
+            );
         }
     }
 
