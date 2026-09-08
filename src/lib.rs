@@ -27,10 +27,8 @@ pub fn rand_string<R: rand_core::Rng>(rng: &mut R, len: usize) -> String {
     {
         if is_x86_feature_detected!("ssse3") {
             // Round up to nearest 16-byte boundary for optimal SIMD processing
-            let simd_len = (len + 15) & !15;
-            // Aligned allocation guarantees the buffer can be used with
-            // _mm_load_si128 (aligned SSE load) without a runtime check.
-            let mut buf = aligned_vec_u8(simd_len);
+            let simd_len = simd_buffer_len(len);
+            let mut buf = Vec::with_capacity(simd_len);
 
             rng.fill_bytes(unsafe {
                 // SAFETY: We're transmuting the spare capacity of the vector to a mutable slice of u8.
@@ -60,7 +58,7 @@ pub fn rand_string<R: rand_core::Rng>(rng: &mut R, len: usize) -> String {
     {
         if std::arch::is_aarch64_feature_detected!("neon") {
             // Round up to nearest 16-byte boundary for optimal SIMD processing
-            let simd_len = (len + 15) & !15;
+            let simd_len = simd_buffer_len(len);
             let mut buf: Vec<u8> = Vec::with_capacity(simd_len);
 
             rng.fill_bytes(unsafe {
@@ -103,36 +101,9 @@ pub fn rand_string<R: rand_core::Rng>(rng: &mut R, len: usize) -> String {
     unsafe { String::from_utf8_unchecked(buf) }
 }
 
-/// Allocates a `Vec<u8>` whose backing buffer is guaranteed to be 16-byte aligned.
-///
-/// Used on x86_64 to satisfy the alignment requirement of `_mm_load_si128`.
-///
-/// # Panics
-/// Panics if `capacity` is 0 or if the allocator reports an out-of-memory condition
-/// when creating the [`Layout`] (mirroring `Vec::with_capacity`'s behavior).
-#[cfg(target_arch = "x86_64")]
-fn aligned_vec_u8(capacity: usize) -> Vec<u8> {
-    assert!(capacity > 0, "aligned_vec_u8 requires non-zero capacity");
-
-    // SAFETY: `Layout::from_size_align(capacity, 16)` is well-defined because
-    // `capacity > 0` and 16 is a power-of-two alignment. We deallocate with the
-    // same layout in the `Drop` shim when the Vec is dropped (via `dealloc`).
-    let layout = unsafe { std::alloc::Layout::from_size_align_unchecked(capacity, 16) };
-
-    // SAFETY: We allocate `capacity` bytes aligned to 16. We never read the buffer
-    // before the caller writes to it via `spare_capacity_mut` + `set_len`.
-    let ptr = unsafe { std::alloc::alloc(layout) };
-    if ptr.is_null() {
-        std::alloc::handle_alloc_error(layout);
-    }
-
-    // SAFETY: `ptr` was just allocated with `alloc` using `layout`, is non-null,
-    // and is exclusively owned by this Vec. Length 0 with capacity `capacity` is
-    // valid; deallocation will use the same `layout` automatically via `dealloc`
-    // (which the global allocator's drop glue matches against the original layout
-    // recorded in the Vec's header — note: this is the critical soundness
-    // invariant — see the dealloc helper below).
-    unsafe { Vec::from_raw_parts(ptr, 0, capacity) }
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn simd_buffer_len(len: usize) -> usize {
+    len.checked_add(15).expect("random string length overflow") & !15
 }
 
 /// Scalar implementation of charset lookup for random string generation.
@@ -197,15 +168,10 @@ unsafe fn rand_string_simd_ssse3(buf: &mut [u8]) {
         let len = buf.len();
         let mut i = 0;
 
-        debug_assert!(
-            buf.as_ptr().addr() & 15 == 0,
-            "pointer must be 16 byte aligned"
-        );
-
         // Process all bytes in 16-byte chunks (buffer length is guaranteed to be a multiple of 16)
         while i < len {
             // Load 16 random bytes
-            let input = _mm_load_si128(buf.as_ptr().add(i) as *const __m128i);
+            let input = _mm_loadu_si128(buf.as_ptr().add(i) as *const __m128i);
 
             // Extract 6 bits per byte (shift right by 2), giving us values 0-63
             let indices = _mm_srli_epi16(input, 2);
@@ -547,20 +513,20 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn test_aligned_vec_u8_alignment() {
-        // The whole point of `aligned_vec_u8` is that the returned Vec's
-        // backing buffer is 16-byte aligned, regardless of allocator behavior.
-        for &cap in &[16usize, 32, 64, 100, 256, 1024] {
-            let v = aligned_vec_u8(cap);
-            assert_eq!(v.capacity(), cap);
-            assert!(v.is_empty());
-            assert_eq!(
-                v.as_ptr().addr() % 16,
-                0,
-                "Vec<u8> of capacity {cap} was not 16-byte aligned",
-            );
-        }
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn test_simd_buffer_len_rounding() {
+        assert_eq!(simd_buffer_len(0), 0);
+        assert_eq!(simd_buffer_len(1), 16);
+        assert_eq!(simd_buffer_len(15), 16);
+        assert_eq!(simd_buffer_len(16), 16);
+        assert_eq!(simd_buffer_len(17), 32);
+    }
+
+    #[test]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[should_panic(expected = "random string length overflow")]
+    fn test_simd_buffer_len_overflow() {
+        simd_buffer_len(usize::MAX);
     }
 
     #[test]
