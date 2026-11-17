@@ -1,3 +1,89 @@
+/// Generates a random string using a human-friendly password alphabet.
+///
+/// The alphabet is `abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789`,
+/// excluding the confusing characters `0`, `1`, `i`, `l`, `o`, `I`, `L`, and `O`.
+/// Characters are sampled uniformly using rejection sampling.
+///
+/// Security depends on the supplied RNG. Use a cryptographically secure RNG for secrets.
+///
+/// # Arguments
+/// * `rng` - The random number generator to use
+/// * `len` - The length of the random string to generate
+///
+/// # Returns
+/// A String of the specified length, or an empty String when `len` is zero.
+pub fn rand_string_human<R: rand_core::Rng>(rng: &mut R, len: usize) -> String {
+    const CHARS: &[u8; 54] = b"abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789";
+    const ACCEPT_BELOW: usize = 256 / CHARS.len() * CHARS.len();
+
+    let mut result = String::with_capacity(len);
+    let mut buf = [0u8; 64];
+
+    while result.len() < len {
+        let chunk_len = (len - result.len()).min(buf.len());
+        rng.fill_bytes(&mut buf[..chunk_len]);
+
+        for &byte in &buf[..chunk_len] {
+            let index = usize::from(byte);
+            if index < ACCEPT_BELOW {
+                result.push(CHARS[index % CHARS.len()] as char);
+            }
+        }
+    }
+
+    result
+}
+
+/// Generates a human-friendly random string containing lowercase, uppercase, and digits.
+///
+/// Uses the same 54-character alphabet as [`rand_string_human`] and requires at least
+/// one lowercase letter, one uppercase letter, and one digit. A length of at least 3
+/// is required.
+///
+/// Generates up to 1024 candidates, returning the first that meets these requirements.
+/// Rejection sampling preserves a uniform distribution over valid strings when the
+/// supplied RNG is uniform. Security depends on the supplied RNG; use a
+/// cryptographically secure RNG for secrets.
+///
+/// # Arguments
+/// * `rng` - The random number generator to use
+/// * `len` - The length of the random string to generate
+///
+/// # Returns
+/// A String of the specified length containing all three character categories.
+///
+/// # Panics
+/// Panics if no candidate meets the requirements within 1024 attempts. Lengths below
+/// 3 cannot meet the requirements and always panic.
+///
+/// # Examples
+/// ```
+/// use rand_utils::rand_string_human_mixed;
+///
+/// let mut rng = rand::rng();
+/// let value = rand_string_human_mixed(&mut rng, 16);
+/// assert_eq!(value.len(), 16);
+/// assert!(value.bytes().any(|byte| byte.is_ascii_lowercase()));
+/// assert!(value.bytes().any(|byte| byte.is_ascii_uppercase()));
+/// assert!(value.bytes().any(|byte| byte.is_ascii_digit()));
+/// ```
+pub fn rand_string_human_mixed<R: rand_core::Rng>(rng: &mut R, len: usize) -> String {
+    assert!(len >= 3, "len must be at least 3");
+
+    const ATTEMPTS: usize = 1024;
+
+    for _ in 0..ATTEMPTS {
+        let s = rand_string_human(rng, len);
+        let mixed = s.bytes().any(|b| b.is_ascii_lowercase())
+            && s.bytes().any(|b| b.is_ascii_uppercase())
+            && s.bytes().any(|b| b.is_ascii_digit());
+        if mixed {
+            return s;
+        }
+    }
+    panic!("rng did not create a mixed case string in {ATTEMPTS} attempts");
+}
+
 /// Generates a random string of specified length using a secure random number generator.
 ///
 /// The generated string contains characters from the set:
@@ -361,6 +447,93 @@ impl rand_core::TryCryptoRng for AwsLcRng {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_rand_string_human_mixed() {
+        use rand::SeedableRng;
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        const CHARS: &[u8] = b"abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789";
+
+        for len in [3, 4, 7, 15, 16, 17, 31, 32, 33, 63, 64, 65, 128, 4096] {
+            let result = rand_string_human_mixed(&mut rng, len);
+            assert_eq!(result.len(), len);
+            assert!(result.bytes().all(|byte| CHARS.contains(&byte)));
+            assert!(result.bytes().any(|byte| byte.is_ascii_lowercase()));
+            assert!(result.bytes().any(|byte| byte.is_ascii_uppercase()));
+            assert!(result.bytes().any(|byte| byte.is_ascii_digit()));
+        }
+    }
+
+    #[test]
+    fn test_rand_string_human_mixed_rejects_short_lengths() {
+        for len in 0..3 {
+            let result = std::panic::catch_unwind(|| {
+                let mut rng = rand::rng();
+                rand_string_human_mixed(&mut rng, len)
+            });
+            assert!(result.is_err(), "length {len} should be rejected");
+        }
+    }
+
+    #[test]
+    fn test_rand_string_human_lengths() {
+        let mut rng = rand::rng();
+        const CHARS: &[u8] = b"abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789";
+
+        for len in [0, 1, 7, 15, 16, 17, 31, 32, 33, 63, 64, 65, 128, 4096] {
+            let result = rand_string_human(&mut rng, len);
+            assert_eq!(result.len(), len);
+            assert!(result.bytes().all(|byte| CHARS.contains(&byte)));
+        }
+    }
+
+    #[test]
+    fn test_rand_string_human_uniform_sampling() {
+        struct CyclingRng {
+            byte: u8,
+            generated: usize,
+        }
+
+        impl rand_core::TryRng for CyclingRng {
+            type Error = core::convert::Infallible;
+
+            fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+                let mut bytes = [0u8; 4];
+                self.try_fill_bytes(&mut bytes)?;
+                Ok(u32::from_le_bytes(bytes))
+            }
+
+            fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+                let mut bytes = [0u8; 8];
+                self.try_fill_bytes(&mut bytes)?;
+                Ok(u64::from_le_bytes(bytes))
+            }
+
+            fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+                for byte in dst.iter_mut() {
+                    *byte = self.byte;
+                    self.byte = self.byte.wrapping_add(1);
+                }
+                self.generated += dst.len();
+                Ok(())
+            }
+        }
+
+        let mut rng = CyclingRng {
+            byte: 216,
+            generated: 0,
+        };
+        assert_eq!(rand_string_human(&mut rng, 0), "");
+        assert_eq!(rng.generated, 0);
+
+        let result = rand_string_human(&mut rng, 216);
+        assert_eq!(
+            result,
+            "abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789".repeat(4)
+        );
+        assert_eq!(rng.generated, 256);
+    }
 
     #[test]
     fn test_rand_string() {
